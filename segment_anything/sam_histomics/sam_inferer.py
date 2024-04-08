@@ -1,31 +1,46 @@
 """Infer SAM-like models on histo tiles."""
 
 from pathlib import Path
-from typing import Any, Literal, Union
+from typing import Any, Literal, Mapping, Optional, Union
 
 import numpy as np
 import torch
-from histomics.data.io.torch_dataset import TrainDataset
 from loguru import logger
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from histomics.data.io.torch_dataset import TrainDataset
+from histomics.metrics.base_metric import DensePredictionMetric
 from segment_anything import sam_model_registry
 from segment_anything.predictor import SamPredictor
 
 
 class SamInferer:
-    """Class to infer a base SAM model on histological tiles."""
+    """Class to infer a base SAM model on histological tiles.
+
+    Parameters
+    ----------
+    model_type : Literal["default", "vit_s", "vit_b", "vit_h"]
+        The type of model to load.
+    path_weights : Union[Path, str]
+        The path to the weights of the model.
+    device : torch.device
+        The device to use for inference.
+    metrics : Optional[Mapping[str, DensePredictionMetric]]
+        The metrics to use for inference.
+    """
 
     def __init__(
         self,
         model_type: Literal["default", "vit_s", "vit_b", "vit_h"],
         path_weights: Union[Path, str],
         device: torch.device,
+        metrics: Optional[Mapping[str, DensePredictionMetric]] = None,
     ):
         self.model_type = model_type
         self.path_weights = path_weights
         self.device = device
+        self.metrics = metrics
 
         self.predictor = self._load_model()
 
@@ -42,7 +57,7 @@ class SamInferer:
 
     @torch.no_grad()
     def infer_on_tile(self, image: np.ndarray, points: np.ndarray) -> list[np.ndarray]:
-        """Infer on a tile.
+        """Infer on a tile, simple version
 
         Parameters
         ----------
@@ -84,7 +99,7 @@ class SamInferer:
         return all_masks
 
     @torch.no_grad()
-    def batch_inference(self, batch: list) -> tuple[np.ndarray, np.ndarray]:
+    def batch_inference(self, batch: list) -> np.ndarray:
         """Perform batch inference of all points on a single input tile.
 
         This method differs from the first one since it uses the predict_torch method
@@ -129,11 +144,11 @@ class SamInferer:
         masks = masks.detach().cpu().numpy()
         scores = scores.detach().cpu().numpy()
 
-        return masks, scores
+        final_masks = self._post_process_mask(masks, scores)
 
-    def infer_on_dataset(
-        self, dataset: TrainDataset
-    ) -> dict[int, np.ndarray]:
+        return final_masks
+
+    def infer_on_dataset(self, dataset: TrainDataset) -> dict[int, np.ndarray]:
         """Infer on an input TrainDataset.
 
         Parameters
@@ -160,9 +175,7 @@ class SamInferer:
         outputs_all_dataset: dict[int, Any] = {}
         for batch in dataloader:
             tile_id = int(batch[2][0])
-            masks, scores = self.batch_inference(batch)
-
-            final_masks = self._post_process_mask(masks, scores)
+            final_masks = self.batch_inference(batch)
 
             outputs_all_dataset[tile_id] = final_masks
 
