@@ -75,14 +75,15 @@ def get_inferer() -> SamInferer:
 
 
 def export_masks_to_dataframe_annotations(
-    dataset_outputs: dict[int, np.ndarray], dataset: TrainDataset
+    dataset_outputs: dict[int, np.ndarray], dataset: TrainDataset, model_name: str
 ) -> pd.DataFrame:
     """Export outputs of a dataset to DB-like annotations in the Database.
 
     Parameters
     ----------
     dataset_outputs : dict[int, np.ndarray]
-        The output of the model.
+        The output of the model. A dictionnary where tile_ids (as ints) are keys and
+        the values are the Boolean numpy arrays.
     dataset : TrainDataset
         The dataset from which the outputs come from.
 
@@ -124,7 +125,7 @@ def export_masks_to_dataframe_annotations(
         df_contours["abstra_slide_path"] = series["abstra_slide_path"]
         df_contours["location_id"] = int(location_id)
         df_contours["cell_type"] = "Cell with unknown type"
-        df_contours["cytomine_username"] = "saminference"
+        df_contours["cytomine_username"] = model_name
 
         all_dataframes.append(df_contours)
 
@@ -337,9 +338,7 @@ def compute_metrics_on_outputs(
         logger.info(
             f"Number of ground truth instances: {ground_truth[0]['masks'].shape[0]}"
         )
-        logger.info(
-            f"Number of prediction instances: {outputs[int(tile_id)].shape[0]}"
-        )
+        logger.info(f"Number of prediction instances: {outputs[int(tile_id)].shape[0]}")
 
         # Get the output from this tile
         predictions = [{"masks": outputs[int(tile_id)].astype(np.uint8)}]
@@ -409,7 +408,7 @@ def contours_to_masks(
     slide_height: int,
     img_shape: tuple[int, int],
 ) -> np.ndarray:
-    """Convert a list of contours in Polygon format to a boolean mask.
+    """Convert a list of contours in Polygon format to a binary mask.
 
     The goal is to convert annnotations from the DB to boolean masks usable
     to compute metrics.
@@ -428,7 +427,7 @@ def contours_to_masks(
     Returns
     -------
     np.ndarray
-        The boolean masks, shape (N_CONTOURS, H, W)
+        The masks in np.uint8 format, shape (N_CONTOURS, H, W)
     """
     masks = np.zeros((len(contours), *img_shape), dtype=np.uint8)
     for idx_contour, contour in enumerate(contours):
@@ -446,6 +445,10 @@ def contours_to_masks(
 def convert_df_annotations_to_masks(df_annotations: pd.DataFrame) -> np.ndarray:
     """Convert DataFrame annotations to masks easily usable for metrics.
 
+    This function takes as input a DataFrame containing the annotations of a pathologist
+    on a single tile, coming from the Database (Cytomine frame reference). It converts
+    the annotations to boolean masks usable to compute metrics.
+
     Parameters
     ----------
     df_annotations : pd.DataFrame
@@ -454,14 +457,14 @@ def convert_df_annotations_to_masks(df_annotations: pd.DataFrame) -> np.ndarray:
         - tile_id: the tile id, should be unique (as we are working on one tile)
         - abstra_slide_path: the path to the slide
         - coords: the coordinates of the tile
-        - coordinates: the coordinates of the polygons in WKT format
+        - coordinates: the coordinates of the polygons in WKT format (in the Cytomine
+        reference frame)
 
     Returns
     -------
     np.ndarray
-        The masks, shape (N_MASKS, H, W)
+        The masks, in uint8 format, of shape (N_MASKS, H, W)
     """
-
     assert df_annotations["tile_id"].nunique() == 1, "Only one tile_id is allowed"
 
     slide_path = df_annotations["abstra_slide_path"].iloc[0]
@@ -477,3 +480,75 @@ def convert_df_annotations_to_masks(df_annotations: pd.DataFrame) -> np.ndarray:
     masks = contours_to_masks(list_polygons, tile_coords, height, img_shape)
 
     return masks
+
+
+def db_annotations_to_inference_outputs(
+    df_annotations: pd.DataFrame,
+    df_tiles_multi_annotations: pd.DataFrame,
+    cytomine_username: str,
+) -> dict[int, np.ndarray]:
+    """Transform annotations from a DB to binary mask outputs used to compute metrics.
+    
+    The input annotations (in the DataFrame) need to be in the Cytomine reference frame,
+    and the df_tiles_multi_annotations (computed with the DatabaseAnnotationPuller
+    `get_multiple_annotated_tiles_df` method) is required to match the tile ids between
+    the tile_id of the current annotator and the tile_id of the ground truth tile (by
+    default, Katharina's annotations).
+    
+    
+    Parameters
+    ----------
+    df_annotations : pd.DataFrame
+        The DataFrame containing the annotations. This dataframe should contain the
+        following columns:
+        - tile_id: the tile id, should be unique (as we are working on one tile)
+        - cytomine_username: the username of the annotator
+    df_tiles_multi_annotations : pd.DataFrame
+        The DataFrame containing the tiles with multiple annotations. This dataframe
+        should contain the following columns:
+        - tile_id: the tile id
+        - list_tile_id_annotations: the list of tile ids of the annotations on this tile
+        - nb_annotations: the number of annotations on this tile
+    cytomine_username : str
+        The username of the annotator for which we want to compute the metrics.
+    
+    Returns
+    -------
+    dict[int, np.ndarray]
+        A dictionary containing the tile_id as keys and the binary masks as values, like
+        the outputs of Nuclick and SAM.
+    """
+    outputs = {}
+
+    df_tiles = df_tiles_multi_annotations.loc[
+        df_tiles_multi_annotations["nb_annotations"] > 1
+    ].copy()
+
+    for idx_row, curr_row in df_tiles.iterrows():
+        # For each tile with multiple annotations, get the tile_ids of the annotations
+        tile_ids = curr_row["list_tile_id_annotations"]
+
+        tile_id_annotator = [
+            x
+            for x in tile_ids
+            if df_annotations.loc[
+                df_annotations["tile_id"] == x, "cytomine_username"
+            ].iloc[0]
+            == cytomine_username
+        ][0]
+        katharina_tile_id = [
+            x
+            for x in tile_ids
+            if df_annotations.loc[
+                df_annotations["tile_id"] == x, "cytomine_username"
+            ].iloc[0]
+            == "kvonloga"
+        ][0]
+
+        annotations_this_annotator = df_annotations.loc[
+            df_annotations["tile_id"] == tile_id_annotator
+        ].copy()
+        masks = convert_df_annotations_to_masks(annotations_this_annotator)
+        outputs[katharina_tile_id] = masks > 0.5
+
+    return outputs
